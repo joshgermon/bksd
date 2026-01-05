@@ -1,12 +1,12 @@
-use crate::core::hardware::HardwareMonitor;
+use crate::core::hardware::HardwareAdapter;
 
 #[cfg(target_os = "linux")]
 mod linux;
 mod simulated;
 
-pub fn get_monitor() -> Box<dyn HardwareMonitor> {
-    if std::env::var("BKSD_SIMULATE").is_ok() {
-        let (monitor, controller) = simulated::SimulatedMonitor::new();
+pub fn get_adapter(simulation: bool) -> Box<dyn HardwareAdapter> {
+    if simulation {
+        let (adapter, controller) = simulated::SimulatedAdapter::new();
 
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
@@ -22,11 +22,11 @@ pub fn get_monitor() -> Box<dyn HardwareMonitor> {
             }
         });
 
-        return Box::new(monitor);
+        return Box::new(adapter);
     }
 
     #[cfg(target_os = "linux")]
     {
-        return Box::new(linux::LinuxMonitor);
+        return Box::new(linux::LinuxAdapter);
     }
 }

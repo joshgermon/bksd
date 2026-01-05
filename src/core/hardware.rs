@@ -14,6 +14,7 @@ pub struct BlockDevice {
     pub capacity: u64,
 }
 
-pub trait HardwareMonitor: Send + Sync {
+pub trait HardwareAdapter: Send + Sync {
     fn start(&self, event_sender: tokio::sync::mpsc::Sender<HardwareEvent>);
+    fn cleanup_device(&self, device: &BlockDevice) -> anyhow::Result<()>;
 }

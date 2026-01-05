@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::core::hardware::{BlockDevice, HardwareEvent, HardwareMonitor};
+use crate::core::hardware::{BlockDevice, HardwareEvent, HardwareAdapter};
 use tokio::sync::mpsc;
 
 enum SimulatedCommand {
@@ -35,13 +35,13 @@ impl Simulator {
     }
 }
 
-pub struct SimulatedMonitor {
+pub struct SimulatedAdapter {
     // We wrap the receiver in a Mutex so we can move it out inside `start()`
     // which takes &self. (Start is only called once).
     cmd_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<SimulatedCommand>>>>,
 }
 
-impl SimulatedMonitor {
+impl SimulatedAdapter {
     pub fn new() -> (Self, Simulator) {
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -54,7 +54,7 @@ impl SimulatedMonitor {
     }
 }
 
-impl HardwareMonitor for SimulatedMonitor {
+impl HardwareAdapter for SimulatedAdapter {
     fn start(&self, daemon_tx: mpsc::Sender<HardwareEvent>) {
         // Steal the receiver from the mutex
         let mut rx = self
@@ -62,9 +62,9 @@ impl HardwareMonitor for SimulatedMonitor {
             .lock()
             .unwrap()
             .take()
-            .expect("SimulatedMonitor::start() called twice");
+            .expect("SimulatedAdapter::start() called twice");
 
-        println!("(SimulatedMonitor) Starting listening for controller commands...");
+        println!("(SimulatedAdapter) Starting listening for controller commands...");
 
         // Bridge task
         tokio::spawn(async move {
@@ -79,5 +79,10 @@ impl HardwareMonitor for SimulatedMonitor {
                 }
             }
         });
+    }
+
+    fn cleanup_device(&self, device: &BlockDevice) -> anyhow::Result<()> {
+        println!("(SimulatedAdapter) Cleaning up device: {} ({})", device.label, device.uuid);
+        Ok(())
     }
 }

@@ -1,7 +1,8 @@
 pub mod hardware;
-pub mod orchestrator;
 pub mod models;
+pub mod orchestrator;
+pub mod transfer_engine;
 
-pub use hardware::{HardwareEvent, BlockDevice, HardwareMonitor};
+pub use hardware::{BlockDevice, HardwareEvent, HardwareAdapter};
+pub use models::{Job, TargetDrive};
 pub use orchestrator::Orchestrator;
-pub use models::{TargetDrive, BackupState};

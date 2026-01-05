@@ -8,4 +8,8 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["full"] }
 anyhow = "1.0"
 tokio-rusqlite = "0.7.0"
-
+uuid = { version = "1.x", features = ["v7"] }
+regex = "1.12.2"
+figment = { version = "0.10", features = ["toml", "env"] }
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["clock", "serde"] }

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
+use bksd::core::transfer_engine::TransferEngineType;
 use bksd::{config, context, core::Orchestrator, db};
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 
 #[derive(Parser)]
 #[command(name = "bksd")]
@@ -9,31 +10,55 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    #[arg(long, global = true)]
+    simulation: Option<bool>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    Daemon,
+    Daemon(ServerArgs),
     Status,
+}
+
+#[derive(Args, Serialize)]
+struct ServerArgs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long)]
+    backup_directory: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long)]
+    transfer_engine: Option<TransferEngineType>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long)]
+    retry_attempts: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long)]
+    verbose: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long)]
+    simulation: Option<bool>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let config = config::AppConfig {
-        backup_directory: PathBuf::from("/tmp/bksd"),
-        retry_attempts: 3,
-        http_port: 8080,
-        simulation: false,
-        verbose: false,
+    let config = match &cli.command {
+        Commands::Daemon(args) => config::AppConfig::new(Some(args))?,
+        _ => config::AppConfig::new(None::<&ServerArgs>)?,
     };
 
-    let db_conn = db::init().await?;
-    let ctx = context::AppContext::new(config, db_conn);
-
     match &cli.command {
-        Commands::Daemon => run_daemon(ctx).await.context("Failed to start daemon")?,
+        Commands::Daemon(_) => {
+            let db_conn = db::init().await?;
+            let ctx = context::AppContext::new(config, db_conn);
+            run_daemon(ctx).await.context("Failed to start daemon")?
+        }
         Commands::Status => run_status().context("Failed to check status of daemon")?,
     }
 
