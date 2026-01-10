@@ -1,12 +1,17 @@
 use chrono::Local;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tracing::{Instrument, error, info, info_span};
 
 use crate::context::AppContext;
 use crate::core::TargetDrive;
 use crate::core::hardware::{BlockDevice, HardwareAdapter, HardwareEvent};
+use crate::core::ownership::get_backup_owner;
 use crate::core::transfer_engine::{self, TransferRequest, TransferStatus};
+use crate::core::verifier::{VerifyRequest, verify_transfer};
+use crate::logging::LogThrottle;
 use crate::{adapters, db};
 use anyhow::Result;
 
@@ -17,7 +22,7 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     pub fn new(ctx: AppContext) -> Self {
-        let adapter: Box<dyn HardwareAdapter> = adapters::get_adapter(ctx.config.simulation);
+        let adapter: Box<dyn HardwareAdapter> = adapters::get_adapter(&ctx.config);
         Self {
             ctx,
             adapter: Arc::from(adapter),
@@ -25,17 +30,30 @@ impl Orchestrator {
     }
 
     pub async fn start(&self) -> Result<()> {
-        println!(">> Sentinel Daemon Starting...");
+        let backup_dir = self.ctx.config.backup_directory.display().to_string();
+        let simulation = self.ctx.config.simulation;
 
-        let (tx, mut rx) = mpsc::channel(32);
+        let span = info_span!(
+            "daemon",
+            backup_dir = %backup_dir,
+            simulation = simulation
+        );
 
-        self.adapter.start(tx);
+        async {
+            info!("Sentinel Daemon starting");
 
-        while let Some(event) = rx.recv().await {
-            self.handle_device_event(event).await;
+            let (tx, mut rx) = mpsc::channel(32);
+
+            self.adapter.start(tx);
+
+            while let Some(event) = rx.recv().await {
+                self.handle_device_event(event).await;
+            }
+
+            Ok(())
         }
-
-        Ok(())
+        .instrument(span)
+        .await
     }
 
     pub async fn handle_device_event(&self, event: HardwareEvent) {
@@ -51,7 +69,20 @@ impl Orchestrator {
     }
 
     async fn handle_device_added(&self, dev: BlockDevice) {
-        println!(">> NEW CARD: {} ({})", dev.label, dev.uuid);
+        let device_span = info_span!(
+            "device",
+            uuid = %dev.uuid,
+            label = %dev.label,
+            filesystem = %dev.filesystem
+        );
+        let _guard = device_span.enter();
+
+        info!(
+            path = %dev.path.display(),
+            mount_point = %dev.mount_point.display(),
+            capacity_mb = dev.capacity / (1024 * 1024),
+            "New device detected"
+        );
 
         let job_id = uuid::Uuid::now_v7().to_string();
         let destination = self.build_destination(&dev.label);
@@ -59,7 +90,7 @@ impl Orchestrator {
         let target_drive = TargetDrive {
             uuid: dev.uuid.clone(),
             label: dev.label.clone(),
-            mount_path: dev.path.to_string_lossy().to_string(),
+            mount_path: dev.mount_point.to_string_lossy().to_string(),
             raw_size: dev.capacity,
         };
 
@@ -74,65 +105,88 @@ impl Orchestrator {
         )
         .await
         {
-            eprintln!(">> FAILED TO CREATE JOB: {}", e);
+            error!(error = %e, "Failed to create job in database");
             return;
         }
 
-        println!(">> JOB CREATED: {}", job_id);
+        info!(
+            job_id = %job_id,
+            source = %dev.mount_point.display(),
+            destination = %destination.display(),
+            "Job created"
+        );
 
         let transfer_req = TransferRequest {
             job_id: job_id.clone(),
-            source: dev.path.clone(),
+            source: dev.mount_point.clone(),
             destination,
+            owner: get_backup_owner(&self.ctx.config.backup_directory),
         };
 
         let (progress_tx, mut progress_rx) = mpsc::channel(100);
         let db = self.ctx.db.clone();
-        let job_id_clone = job_id.clone();
         let adapter = self.adapter.clone();
-        let dev_clone = dev.clone();
+        let progress_tracker = self.ctx.progress.clone();
 
+        // Progress throttle: only log every 500ms
+        let throttle = LogThrottle::new(Duration::from_millis(500));
+
+        let job_span = info_span!(
+            "job",
+            job_id = %job_id,
+            source = %dev.mount_point.display(),
+            destination = %transfer_req.destination.display()
+        );
+
+        let config = self.ctx.config.clone();
         tokio::spawn(async move {
-            while let Some(status) = progress_rx.recv().await {
-                let (status_str, description) = match &status {
-                    TransferStatus::Ready => ("Ready", None),
-                    TransferStatus::InProgress { percentage, .. } => {
-                        println!(">> PROGRESS: {}%", percentage);
-                        ("InProgress", Some(format!("{}% complete", percentage)))
-                    }
-                    TransferStatus::CopyComplete => ("CopyComplete", None),
-                    TransferStatus::Verifying { current, total } => {
-                        ("Verifying", Some(format!("{}/{}", current, total)))
-                    }
-                    TransferStatus::Complete => ("Complete", None),
-                    TransferStatus::Failed(msg) => ("Failed", Some(msg.clone())),
-                };
-
-                let _ = db::jobs::update_status(
-                    &db,
-                    job_id_clone.clone(),
-                    status_str.to_string(),
-                    description,
-                )
+            let transfer_result = transfer_engine
+                .transfer(&transfer_req, progress_tx.clone())
                 .await;
 
-                if matches!(status, TransferStatus::Complete | TransferStatus::Failed(_)) {
-                    println!(">> JOB FINISHED: {} (Status: {:?})", job_id_clone, status);
-                    let _ = adapter.cleanup_device(&dev_clone);
-                    break;
-                }
-            }
-        });
+            match transfer_result {
+                Ok(result) => {
+                    let _ = progress_tx.send(TransferStatus::CopyComplete).await;
 
-        // Start transfer
-        tokio::spawn(async move {
-            if let Err(e) = transfer_engine.transfer(&transfer_req, progress_tx).await {
-                eprintln!(">> TRANSFER ERROR [{}]: {}", job_id, e);
+                    if config.verify_transfers && !config.simulation {
+                        let verify_req = VerifyRequest {
+                            job_id: job_id.clone(),
+                            source: transfer_req.source.clone(),
+                            destination: transfer_req.destination.clone(),
+                        };
+
+                        match verify_transfer(&verify_req, progress_tx.clone()).await {
+                            Ok(_verify_result) => {
+                                let _ = progress_tx
+                                    .send(TransferStatus::Complete {
+                                        total_bytes: result.total_bytes,
+                                        duration_secs: result.duration_secs,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = progress_tx
+                                    .send(TransferStatus::Failed(e.to_string()))
+                                    .await;
+                            }
+                        }
+                    } else {
+                        let _ = progress_tx
+                            .send(TransferStatus::Complete {
+                                total_bytes: result.total_bytes,
+                                duration_secs: result.duration_secs,
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    error!(job_id = %job_id, error = %e, "Transfer error");
+                }
             }
         });
     }
 
     async fn handle_device_removed(&self, uuid: String) {
-        println!(">> REMOVED: {}", uuid);
+        info!(uuid = %uuid, "Device removed");
     }
 }

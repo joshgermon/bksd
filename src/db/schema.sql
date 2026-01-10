@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS job_status_log (
     job_id TEXT NOT NULL,
     status TEXT NOT NULL,
     description TEXT,
+    -- Completion metadata (only populated for Complete status)
+    total_bytes INTEGER,
+    duration_secs INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(job_id) REFERENCES jobs(id)
 );

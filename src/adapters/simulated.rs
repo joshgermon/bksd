@@ -3,8 +3,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::core::hardware::{BlockDevice, HardwareEvent, HardwareAdapter};
+use anyhow::Result;
 use tokio::sync::mpsc;
+use tracing::{debug, info};
+
+use crate::core::hardware::{BlockDevice, HardwareAdapter, HardwareEvent};
 
 enum SimulatedCommand {
     InjectAdd(BlockDevice),
@@ -22,7 +25,9 @@ impl Simulator {
             uuid: uuid.to_string(),
             label: format!("TEST_DEVICE_{}", uuid),
             path: PathBuf::from(format!("/tmp/test_{}", uuid)),
+            mount_point: PathBuf::from(format!("/tmp/mnt_{}", uuid)),
             capacity: size_gb * 1024 * 1024 * 1024,
+            filesystem: "ext4".to_string(),
         };
 
         let _ = self.tx.send(SimulatedCommand::InjectAdd(device));
@@ -64,7 +69,7 @@ impl HardwareAdapter for SimulatedAdapter {
             .take()
             .expect("SimulatedAdapter::start() called twice");
 
-        println!("(SimulatedAdapter) Starting listening for controller commands...");
+        info!("SimulatedAdapter listening for controller commands");
 
         // Bridge task
         tokio::spawn(async move {
@@ -81,8 +86,22 @@ impl HardwareAdapter for SimulatedAdapter {
         });
     }
 
-    fn cleanup_device(&self, device: &BlockDevice) -> anyhow::Result<()> {
-        println!("(SimulatedAdapter) Cleaning up device: {} ({})", device.label, device.uuid);
+    fn stop(&self) {
+        // No-op for simulated adapter
+        info!("SimulatedAdapter stop requested");
+    }
+
+    fn list_devices(&self) -> Result<Vec<BlockDevice>> {
+        // Simulated adapter doesn't track devices persistently
+        Ok(vec![])
+    }
+
+    fn cleanup_device(&self, device: &BlockDevice) -> Result<()> {
+        debug!(
+            label = %device.label,
+            uuid = %device.uuid,
+            "SimulatedAdapter cleaning up device"
+        );
         Ok(())
     }
 }
