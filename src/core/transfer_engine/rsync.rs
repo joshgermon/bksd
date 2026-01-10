@@ -28,6 +28,16 @@ impl TransferEngine for RsyncEngine {
             let source = req.source.to_string_lossy().to_string();
             let destination = req.destination.to_string_lossy().to_string();
 
+            // Safety check: fail if destination already exists to prevent overwrites
+            if req.destination.exists() {
+                let msg = format!(
+                    "Destination already exists: {}. Refusing to overwrite.",
+                    req.destination.display()
+                );
+                let _ = tx.send(TransferStatus::Failed(msg.clone())).await;
+                return Err(anyhow!(msg));
+            }
+
             if let Err(e) = std::fs::create_dir_all(&req.destination) {
                 let msg = format!("Failed to create destination directory: {}", e);
                 let _ = tx.send(TransferStatus::Failed(msg.clone())).await;

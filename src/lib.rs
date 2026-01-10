@@ -5,3 +5,4 @@ pub mod core;
 pub mod db;
 pub mod logging;
 pub mod rpc;
+pub mod service;

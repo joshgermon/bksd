@@ -1,11 +1,31 @@
 use crate::core::transfer_engine::TransferEngineType;
 use figment::{
     Figment,
-    providers::{Env, Serialized},
+    providers::{Env, Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/bksd/config.toml";
+
+/// Type of notification channel to use
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationChannelType {
+    #[default]
+    None,
+    Slack,
+}
+
+/// Configuration for the notification system
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotificationConfig {
+    /// Which notification channel to use
+    pub channel: NotificationChannelType,
+    /// Slack webhook URL (required when channel = "slack")
+    pub slack_webhook: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -23,6 +43,8 @@ pub struct AppConfig {
     pub rpc_bind: SocketAddr,
     /// Verify file integrity after transfer using BLAKE3 checksums
     pub verify_transfers: bool,
+    /// Notification settings
+    pub notifications: NotificationConfig,
 }
 
 impl Default for AppConfig {
@@ -38,13 +60,16 @@ impl Default for AppConfig {
             rpc_enabled: true,
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], 9847)),
             verify_transfers: true,
+            notifications: NotificationConfig::default(),
         }
     }
 }
 
 impl AppConfig {
     pub fn new(args: Option<&impl Serialize>) -> Result<Self, figment::Error> {
-        let mut figment = Figment::new().merge(Serialized::defaults(AppConfig::default()));
+        let mut figment = Figment::new()
+            .merge(Serialized::defaults(AppConfig::default()))
+            .merge(Toml::file(SYSTEM_CONFIG_PATH));
 
         if let Some(args) = args {
             figment = figment.merge(Serialized::defaults(args));

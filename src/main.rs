@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use bksd::core::transfer_engine::TransferEngineType;
 use bksd::logging::{self, LogConfig};
 use bksd::rpc::{RpcClient, RpcServer};
+use bksd::service::{ServiceManager, configs_differ, prompt_restart};
 use bksd::{config, context, core::Orchestrator, db};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -16,30 +17,33 @@ use std::sync::Arc;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-
-    #[arg(long, global = true)]
-    simulation: Option<bool>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Start the backup daemon
-    Daemon(ServerArgs),
+    Start(StartArgs),
     /// Query daemon status and active jobs
     Status(StatusArgs),
 }
 
 #[derive(Args)]
 struct StatusArgs {
-    /// Address of the daemon RPC server
     #[arg(short, long, default_value = "127.0.0.1:9847")]
     addr: SocketAddr,
 }
 
 #[derive(Args, Serialize)]
-struct ServerArgs {
-    #[arg(short = 'd', long)]
-    backup_directory: String,
+struct StartArgs {
+    backup_directory: PathBuf,
+
+    #[arg(long)]
+    #[serde(skip)]
+    foreground: bool,
+
+    #[arg(short = 'y', long)]
+    #[serde(skip)]
+    yes: bool,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(short = 'e', long)]
@@ -66,33 +70,80 @@ struct ServerArgs {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let config = match &cli.command {
-        Commands::Daemon(args) => config::AppConfig::new(Some(args))?,
-        _ => config::AppConfig::new(None::<&ServerArgs>)?,
-    };
+    match cli.command {
+        Commands::Start(args) => run_start(args).await,
+        Commands::Status(args) => run_status(args.addr).await,
+    }
+}
+
+async fn run_start(args: StartArgs) -> Result<()> {
+    if args.foreground {
+        return run_foreground(args).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    check_root_privileges()?;
+
+    let svc = ServiceManager::new();
+    let new_config = config::AppConfig::new(Some(&args))?;
+
+    if !svc.is_installed() {
+        println!("Installing bksd service...");
+        svc.install_and_start(&new_config)?;
+        println!("Service installed and started successfully.\n");
+        println!("  Check status: bksd status");
+        println!("  View logs:    journalctl -u bksd -f");
+        return Ok(());
+    }
+
+    let is_running = svc.is_running()?;
+    let current_config = svc.load_current_config()?;
+
+    match (is_running, current_config) {
+        (true, Some(ref current)) if configs_differ(current, &new_config) => {
+            let should_restart = if args.yes {
+                true
+            } else {
+                prompt_restart(current, &new_config)?
+            };
+
+            if should_restart {
+                println!("Updating configuration and restarting...");
+                svc.update_config_and_restart(&new_config)?;
+                println!("Service restarted with new configuration.");
+            } else {
+                println!("Keeping current configuration.");
+            }
+        }
+        (true, _) => {
+            println!("bksd is already running.");
+        }
+        (false, _) => {
+            println!("Starting bksd service...");
+            svc.start()?;
+            println!("Service started.");
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_foreground(args: StartArgs) -> Result<()> {
+    let config = config::AppConfig::new(Some(&args))?;
 
     logging::init(LogConfig {
         json: config.log_json,
         verbose: config.verbose,
     });
 
-    match &cli.command {
-        Commands::Daemon(_) => {
-            #[cfg(target_os = "linux")]
-            if !config.simulation {
-                check_root_privileges()?;
-            }
-
-            let db_conn = db::init().await?;
-            let ctx = context::AppContext::new(config, db_conn);
-            run_daemon(ctx).await.context("Failed to start daemon")?
-        }
-        Commands::Status(args) => run_status(args.addr)
-            .await
-            .context("Failed to check status of daemon")?,
+    #[cfg(target_os = "linux")]
+    if !config.simulation {
+        check_root_privileges()?;
     }
 
-    Ok(())
+    let db_conn = db::init().await?;
+    let ctx = context::AppContext::new(config, db_conn);
+    run_daemon(ctx).await.context("Failed to start daemon")
 }
 
 async fn run_daemon(ctx: context::AppContext) -> Result<()> {
@@ -111,7 +162,6 @@ async fn run_daemon(ctx: context::AppContext) -> Result<()> {
 
     let result = Orchestrator::new(ctx).start().await;
 
-    // Shutdown RPC server
     if let Some((server, handle)) = rpc_server {
         server.shutdown();
         handle.abort();
@@ -149,7 +199,6 @@ async fn run_status(addr: SocketAddr) -> Result<()> {
     );
     println!("  Active Jobs: {}", status.active_jobs);
 
-    // If there are active jobs, show their progress
     if status.active_jobs > 0 {
         #[derive(Deserialize)]
         struct ActiveProgress {
@@ -206,7 +255,6 @@ async fn run_status(addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-/// Generate an ASCII progress bar
 fn progress_bar(percentage: u8, width: usize) -> String {
     let percentage = percentage.min(100) as usize;
     let filled = (percentage * width) / 100;
@@ -220,8 +268,8 @@ fn check_root_privileges() -> Result<()> {
 
     if !Uid::effective().is_root() {
         anyhow::bail!(
-            "The daemon requires root privileges for mounting devices.\n\
-             Run with: sudo cargo run daemon\n\
+            "This operation requires root privileges.\n\
+             Run with: sudo bksd start <backup_dir>\n\
              Or use --simulation for testing without real devices."
         );
     }

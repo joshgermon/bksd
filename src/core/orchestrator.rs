@@ -3,11 +3,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{Instrument, error, info, info_span};
+use tracing::{Instrument, error, info, info_span, warn};
 
 use crate::context::AppContext;
 use crate::core::TargetDrive;
 use crate::core::hardware::{BlockDevice, HardwareAdapter, HardwareEvent};
+use crate::core::notifications::JobEvent;
 use crate::core::ownership::get_backup_owner;
 use crate::core::transfer_engine::{self, TransferRequest, TransferStatus};
 use crate::core::verifier::{VerifyRequest, verify_transfer};
@@ -116,6 +117,23 @@ impl Orchestrator {
             "Job created"
         );
 
+        // Send "Started" notification
+        if let Some(ref notifier) = self.ctx.notifier {
+            let event = JobEvent::Started {
+                job_id: job_id.clone(),
+                device_label: dev.label.clone(),
+                device_uuid: dev.uuid.clone(),
+                source: dev.mount_point.clone(),
+                destination: destination.clone(),
+            };
+            let notifier = notifier.clone();
+            tokio::spawn(async move {
+                if let Err(e) = notifier.notify(event).await {
+                    warn!(error = %e, "Failed to send start notification");
+                }
+            });
+        }
+
         let transfer_req = TransferRequest {
             job_id: job_id.clone(),
             source: dev.mount_point.clone(),
@@ -139,6 +157,11 @@ impl Orchestrator {
         );
 
         let config = self.ctx.config.clone();
+        let notifier = self.ctx.notifier.clone();
+        let device_label = dev.label.clone();
+        let job_id_for_consumer = job_id.clone();
+
+        // Spawn transfer task
         tokio::spawn(async move {
             let transfer_result = transfer_engine
                 .transfer(&transfer_req, progress_tx.clone())
@@ -181,9 +204,120 @@ impl Orchestrator {
                 }
                 Err(e) => {
                     error!(job_id = %job_id, error = %e, "Transfer error");
+                    let _ = progress_tx
+                        .send(TransferStatus::Failed(e.to_string()))
+                        .await;
                 }
             }
         });
+
+        // Spawn progress consumer task
+        tokio::spawn(
+            async move {
+                while let Some(status) = progress_rx.recv().await {
+                    // Log progress with throttling
+                    if let TransferStatus::InProgress { percentage, .. } = &status {
+                        if throttle.should_log() {
+                            info!(percentage = %percentage, "Transfer progress");
+                        }
+                    }
+
+                    // Update in-memory tracker
+                    progress_tracker
+                        .update(&job_id_for_consumer, status.clone())
+                        .await;
+
+                    // Persist and notify based on status
+                    match &status {
+                        TransferStatus::CopyComplete => {
+                            let _ = db::jobs::update_status(
+                                &db,
+                                job_id_for_consumer.clone(),
+                                "copy_complete".to_string(),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                        }
+                        TransferStatus::Verifying { current, total } => {
+                            let _ = db::jobs::update_status(
+                                &db,
+                                job_id_for_consumer.clone(),
+                                "verifying".to_string(),
+                                Some(format!("{}/{} files", current, total)),
+                                None,
+                                None,
+                            )
+                            .await;
+                        }
+                        TransferStatus::Complete {
+                            total_bytes,
+                            duration_secs,
+                        } => {
+                            let _ = db::jobs::update_status(
+                                &db,
+                                job_id_for_consumer.clone(),
+                                "complete".to_string(),
+                                None,
+                                Some(*total_bytes),
+                                Some(*duration_secs),
+                            )
+                            .await;
+
+                            // Send completion notification
+                            if let Some(ref notifier) = notifier {
+                                let event = JobEvent::Completed {
+                                    job_id: job_id_for_consumer.clone(),
+                                    device_label: device_label.clone(),
+                                    total_bytes: *total_bytes,
+                                    duration_secs: *duration_secs,
+                                };
+                                if let Err(e) = notifier.notify(event).await {
+                                    warn!(error = %e, "Failed to send completion notification");
+                                }
+                            }
+
+                            // Cleanup: unmount device if we mounted it
+                            if let Err(e) = adapter.cleanup_device(&dev) {
+                                error!(error = %e, "Failed to cleanup device");
+                            }
+
+                            progress_tracker.remove(&job_id_for_consumer).await;
+                            break;
+                        }
+                        TransferStatus::Failed(error) => {
+                            let _ = db::jobs::update_status(
+                                &db,
+                                job_id_for_consumer.clone(),
+                                "failed".to_string(),
+                                Some(error.clone()),
+                                None,
+                                None,
+                            )
+                            .await;
+
+                            // Send failure notification
+                            if let Some(ref notifier) = notifier {
+                                let event = JobEvent::Failed {
+                                    job_id: job_id_for_consumer.clone(),
+                                    device_label: device_label.clone(),
+                                    error: error.clone(),
+                                };
+                                if let Err(e) = notifier.notify(event).await {
+                                    warn!(error = %e, "Failed to send failure notification");
+                                }
+                            }
+
+                            progress_tracker.remove(&job_id_for_consumer).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            .instrument(job_span),
+        );
     }
 
     async fn handle_device_removed(&self, uuid: String) {

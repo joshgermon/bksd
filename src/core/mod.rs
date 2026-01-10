@@ -1,5 +1,6 @@
 pub mod hardware;
 pub mod models;
+pub mod notifications;
 pub mod orchestrator;
 pub mod ownership;
 pub mod progress;
