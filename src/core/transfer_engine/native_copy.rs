@@ -138,6 +138,7 @@ impl TransferEngine for NativeCopyEngine {
                     &scan_result.files,
                     scan_result.total_bytes,
                     &copy_options,
+                    start_time,
                     tx.clone(),
                 )
                 .await;
@@ -356,6 +357,7 @@ async fn copy_files_with_progress(
     files: &[FileInfo],
     total_bytes: u64,
     options: &CopyOptions,
+    start_time: Instant,
     tx: mpsc::Sender<TransferStatus>,
 ) -> Result<u64> {
     let source = source.to_path_buf();
@@ -393,11 +395,19 @@ async fn copy_files_with_progress(
                             100
                         };
 
+                        // Calculate ETA based on current transfer speed
+                        let eta_seconds = calculate_eta(
+                            start_time,
+                            bytes_copied,
+                            total_bytes,
+                        );
+
                         let _ = tx.blocking_send(TransferStatus::InProgress {
                             total_bytes,
                             bytes_copied,
                             current_file: current_file.clone(),
                             percentage,
+                            eta_seconds,
                         });
 
                         last_progress_update = bytes_copied;
@@ -579,6 +589,36 @@ fn preserve_timestamps(source: &Path, dest: &Path) -> Result<()> {
 
     filetime::set_file_times(dest, atime, mtime)?;
     Ok(())
+}
+
+/// Calculate estimated time remaining based on current transfer speed.
+///
+/// Returns None if:
+/// - Transfer just started (< 1 second elapsed, speed unreliable)
+/// - No bytes copied yet
+/// - Already complete
+fn calculate_eta(start_time: Instant, bytes_copied: u64, total_bytes: u64) -> Option<u64> {
+    if bytes_copied == 0 || bytes_copied >= total_bytes {
+        return None;
+    }
+
+    let elapsed = start_time.elapsed();
+    let elapsed_secs = elapsed.as_secs_f64();
+
+    // Need at least 1 second of data for reliable speed estimate
+    if elapsed_secs < 1.0 {
+        return None;
+    }
+
+    let bytes_per_sec = bytes_copied as f64 / elapsed_secs;
+    if bytes_per_sec <= 0.0 {
+        return None;
+    }
+
+    let remaining_bytes = total_bytes - bytes_copied;
+    let eta_secs = remaining_bytes as f64 / bytes_per_sec;
+
+    Some(eta_secs.ceil() as u64)
 }
 
 /// Check if an I/O error indicates the device has been removed

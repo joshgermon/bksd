@@ -47,12 +47,23 @@ impl TransferEngine for SimulatedEngine {
 
                 let percentage = ((copied as f64 / total_size as f64) * 100.0) as u8;
 
+                // Calculate ETA based on simulated speed
+                let elapsed_secs = start_time.elapsed().as_secs_f64();
+                let eta_seconds = if elapsed_secs >= 1.0 && copied < total_size {
+                    let bytes_per_sec = copied as f64 / elapsed_secs;
+                    let remaining = total_size - copied;
+                    Some((remaining as f64 / bytes_per_sec).ceil() as u64)
+                } else {
+                    None
+                };
+
                 let _ = tx
                     .send(TransferStatus::InProgress {
                         total_bytes: total_size,
                         bytes_copied: copied,
                         current_file: "simulated_file.dat".to_string(),
                         percentage,
+                        eta_seconds,
                     })
                     .await;
 
