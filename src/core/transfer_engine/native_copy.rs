@@ -594,19 +594,45 @@ fn is_device_removed_error(error: &io::Error) -> bool {
         _ => {
             // Check for specific errno values that indicate device issues
             if let Some(os_error) = error.raw_os_error() {
-                matches!(
-                    os_error,
-                    libc::EIO       // I/O error
-                    | libc::ENODEV  // No such device
-                    | libc::ENXIO   // No such device or address
-                    | libc::ENOMEDIUM // No medium found
-                    | libc::EMEDIUMTYPE // Wrong medium type
-                )
+                is_device_error_code(os_error)
             } else {
                 false
             }
         }
     }
+}
+
+/// Check errno codes for device removal (cross-platform)
+#[cfg(target_os = "linux")]
+fn is_device_error_code(code: i32) -> bool {
+    matches!(
+        code,
+        libc::EIO           // I/O error
+        | libc::ENODEV      // No such device
+        | libc::ENXIO       // No such device or address
+        | libc::ENOMEDIUM   // No medium found (Linux only)
+        | libc::EMEDIUMTYPE // Wrong medium type (Linux only)
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn is_device_error_code(code: i32) -> bool {
+    matches!(
+        code,
+        libc::EIO      // I/O error
+        | libc::ENODEV // No such device
+        | libc::ENXIO  // No such device or address
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_device_error_code(code: i32) -> bool {
+    matches!(
+        code,
+        libc::EIO      // I/O error
+        | libc::ENODEV // No such device
+        | libc::ENXIO  // No such device or address
+    )
 }
 
 #[cfg(test)]
