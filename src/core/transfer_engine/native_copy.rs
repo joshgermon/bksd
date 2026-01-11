@@ -282,6 +282,8 @@ fn scan_directory_recursive(
             let size = metadata.len();
             *total_bytes += size;
             files.push(FileInfo { path, size });
+        } else if metadata.file_type().is_symlink() {
+            debug!(path = %path.display(), "Skipping symlink entry");
         }
         // Skip symlinks and other special files
     }
