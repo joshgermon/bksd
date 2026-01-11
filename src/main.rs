@@ -25,10 +25,18 @@ enum Commands {
     Start(StartArgs),
     /// Query daemon status and active jobs
     Status(StatusArgs),
+    /// Interactive TUI for browsing jobs
+    Tui(TuiArgs),
 }
 
 #[derive(Args)]
 struct StatusArgs {
+    #[arg(short, long, default_value = "127.0.0.1:9847")]
+    addr: SocketAddr,
+}
+
+#[derive(Args)]
+struct TuiArgs {
     #[arg(short, long, default_value = "127.0.0.1:9847")]
     addr: SocketAddr,
 }
@@ -73,6 +81,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Start(args) => run_start(args).await,
         Commands::Status(args) => run_status(args.addr).await,
+        Commands::Tui(args) => bksd::cli::tui::run(args.addr).await,
     }
 }
 
