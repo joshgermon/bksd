@@ -81,6 +81,7 @@ mod tests {
                     bytes_copied: 500,
                     current_file: "test.txt".to_string(),
                     percentage: 50,
+                    eta_seconds: Some(10),
                 },
             )
             .await;
@@ -100,6 +101,7 @@ mod tests {
                     bytes_copied: 750,
                     current_file: "test.txt".to_string(),
                     percentage: 75,
+                    eta_seconds: Some(5),
                 },
             )
             .await;
@@ -129,6 +131,7 @@ mod tests {
                     bytes_copied: 500,
                     current_file: "file.txt".to_string(),
                     percentage: 50,
+                    eta_seconds: None,
                 },
             )
             .await;

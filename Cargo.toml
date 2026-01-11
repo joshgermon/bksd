@@ -25,6 +25,9 @@ libc = "0.2"
 # Verification
 blake3 = "1"
 
+# File timestamps for native copy engine
+filetime = "0.2"
+
 # Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }

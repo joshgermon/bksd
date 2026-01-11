@@ -120,6 +120,7 @@ impl TransferEngine for RsyncEngine {
                                     bytes_copied,
                                     current_file: String::new(),
                                     percentage,
+                                    eta_seconds: None, // rsync doesn't know total size upfront
                                 })
                                 .await;
                         }
