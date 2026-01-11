@@ -1,3 +1,4 @@
+mod native_copy;
 mod rsync;
 mod simulated;
 
@@ -12,7 +13,11 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 pub enum TransferEngineType {
+    /// Native Rust file copy - safe, fast, with progress tracking
+    NativeCopy,
+    /// External rsync process
     Rsync,
+    /// Simulated transfers for testing
     Simulated,
 }
 
@@ -68,6 +73,7 @@ pub trait TransferEngine: Send + Sync {
 
 pub fn create_engine(engine_type: TransferEngineType) -> Box<dyn TransferEngine> {
     match engine_type {
+        TransferEngineType::NativeCopy => Box::new(native_copy::NativeCopyEngine::default()),
         TransferEngineType::Rsync => Box::new(rsync::RsyncEngine),
         TransferEngineType::Simulated => Box::new(simulated::SimulatedEngine::default()),
     }
