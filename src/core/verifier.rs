@@ -1,17 +1,9 @@
 use anyhow::{Result, bail};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::core::transfer_engine::TransferStatus;
-
-/// Request to verify a completed transfer
-pub struct VerifyRequest {
-    pub job_id: String,
-    pub source: PathBuf,
-    pub destination: PathBuf,
-}
+use crate::core::transfer_engine::FileHash;
 
 /// Result of a successful verification
 #[derive(Debug)]
@@ -36,167 +28,121 @@ pub enum MismatchReason {
     MissingInDestination,
 }
 
-/// Verify all files in source exist in destination with matching BLAKE3 checksums.
+/// Verify destination files against pre-computed hashes from the transfer.
 ///
-/// Processes files sequentially to avoid overwhelming slow storage devices.
-/// Collects all mismatches before returning an error.
+/// This is the fast verification path - it only reads destination files
+/// since source files were already hashed during the copy operation.
 ///
-/// Sends `TransferStatus::Verifying { current, total }` progress updates.
-pub async fn verify_transfer(
-    req: &VerifyRequest,
-    tx: mpsc::Sender<TransferStatus>,
+/// Returns Ok if all files match, Err with details if any mismatches found.
+pub async fn verify_from_hashes(
+    job_id: &str,
+    destination: &Path,
+    file_hashes: &[FileHash],
 ) -> Result<VerifyResult> {
-    // Collect all files in source directory
-    let files = collect_files(&req.source).await?;
-    let total = files.len() as u64;
+    let total = file_hashes.len() as u64;
 
-    info!(job_id = %req.job_id, total_files = total, "Starting verification");
+    info!(job_id = %job_id, total_files = total, "Starting hash verification");
 
     if total == 0 {
-        debug!(job_id = %req.job_id, "No files to verify");
+        debug!(job_id = %job_id, "No files to verify");
         return Ok(VerifyResult {
             files_verified: 0,
             bytes_verified: 0,
         });
     }
 
-    let _ = tx
-        .send(TransferStatus::Verifying { current: 0, total })
-        .await;
+    let destination = destination.to_path_buf();
+    let file_hashes = file_hashes.to_vec();
+    let job_id = job_id.to_string();
 
-    let mut mismatches: Vec<FileMismatch> = Vec::new();
-    let mut bytes_verified: u64 = 0;
+    // Run verification in a blocking task since it's I/O heavy
+    tokio::task::spawn_blocking(move || {
+        let mut mismatches: Vec<FileMismatch> = Vec::new();
+        let mut bytes_verified: u64 = 0;
 
-    for (i, source_path) in files.iter().enumerate() {
-        let relative = source_path
-            .strip_prefix(&req.source)
-            .expect("file should be under source directory");
-        let dest_path = req.destination.join(relative);
+        for fh in &file_hashes {
+            let dest_path = destination.join(&fh.relative_path);
 
-        debug!(file = %relative.display(), "Verifying file");
+            debug!(file = %fh.relative_path.display(), "Verifying file");
 
-        if !dest_path.exists() {
-            mismatches.push(FileMismatch {
-                relative_path: relative.to_path_buf(),
-                reason: MismatchReason::MissingInDestination,
-            });
+            if !dest_path.exists() {
+                mismatches.push(FileMismatch {
+                    relative_path: fh.relative_path.clone(),
+                    reason: MismatchReason::MissingInDestination,
+                });
+                continue;
+            }
 
-            // Still send progress update
-            let current = (i + 1) as u64;
-            let _ = tx.send(TransferStatus::Verifying { current, total }).await;
-            continue;
-        }
-
-        let source_path_clone = source_path.clone();
-        let dest_path_clone = dest_path.clone();
-
-        let (source_hash, dest_hash) =
-            tokio::try_join!(hash_file(&source_path_clone), hash_file(&dest_path_clone),)?;
-
-        if source_hash != dest_hash {
-            mismatches.push(FileMismatch {
-                relative_path: relative.to_path_buf(),
-                reason: MismatchReason::HashMismatch,
-            });
-        } else {
-            // Only count bytes for successfully verified files
-            if let Ok(metadata) = std::fs::metadata(source_path) {
-                bytes_verified += metadata.len();
+            // Hash the destination file
+            match hash_file_sync(&dest_path) {
+                Ok(dest_hash) => {
+                    if dest_hash.as_bytes() != &fh.hash {
+                        mismatches.push(FileMismatch {
+                            relative_path: fh.relative_path.clone(),
+                            reason: MismatchReason::HashMismatch,
+                        });
+                    } else {
+                        bytes_verified += fh.size;
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        file = %fh.relative_path.display(),
+                        error = %e,
+                        "Failed to hash destination file"
+                    );
+                    mismatches.push(FileMismatch {
+                        relative_path: fh.relative_path.clone(),
+                        reason: MismatchReason::HashMismatch,
+                    });
+                }
             }
         }
 
-        // Send progress update
-        let current = (i + 1) as u64;
-        let _ = tx.send(TransferStatus::Verifying { current, total }).await;
-    }
+        // Report results
+        if !mismatches.is_empty() {
+            let error_msg = format_mismatch_error(&mismatches);
+            info!(
+                job_id = %job_id,
+                mismatches = mismatches.len(),
+                "Verification failed"
+            );
+            bail!(error_msg);
+        }
 
-    // Report results
-    if !mismatches.is_empty() {
-        let error_msg = format_mismatch_error(&mismatches);
         info!(
-            job_id = %req.job_id,
-            mismatches = mismatches.len(),
-            "Verification failed"
+            job_id = %job_id,
+            files_verified = total,
+            bytes_verified = bytes_verified,
+            "Verification complete"
         );
-        bail!(error_msg);
-    }
 
-    info!(
-        job_id = %req.job_id,
-        files_verified = total,
-        bytes_verified = bytes_verified,
-        "Verification complete"
-    );
-
-    Ok(VerifyResult {
-        files_verified: total,
-        bytes_verified,
-    })
-}
-
-/// Collect all file paths under a directory (recursive)
-async fn collect_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut files = Vec::new();
-        collect_files_recursive(&dir, &mut files)?;
-        Ok(files)
+        Ok(VerifyResult {
+            files_verified: total,
+            bytes_verified,
+        })
     })
     .await?
 }
 
-fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            // Directory might not exist or be readable
-            bail!("Failed to read directory {}: {}", dir.display(), e);
+/// Hash a file using BLAKE3, streaming in chunks to handle large files (sync version)
+fn hash_file_sync(path: &Path) -> Result<blake3::Hash> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open {}: {}", path.display(), e))?;
+
+    let mut reader = std::io::BufReader::with_capacity(128 * 1024, file);
+    let mut hasher = blake3::Hasher::new();
+
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
         }
-    };
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-
-        // Use symlink_metadata to avoid following symlinks
-        let metadata = match path.symlink_metadata() {
-            Ok(m) => m,
-            Err(_) => continue, // Skip entries we can't read
-        };
-
-        if metadata.is_dir() {
-            collect_files_recursive(&path, files)?;
-        } else if metadata.is_file() {
-            files.push(path);
-        }
-        // Skip symlinks and other special files
+        hasher.update(&buffer[..bytes_read]);
     }
 
-    Ok(())
-}
-
-/// Hash a file using BLAKE3, streaming in chunks to handle large files
-async fn hash_file(path: &Path) -> Result<blake3::Hash> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to open {}: {}", path.display(), e))?;
-
-        let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
-        let mut hasher = blake3::Hasher::new();
-
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let bytes_read = reader.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..bytes_read]);
-        }
-
-        Ok(hasher.finalize())
-    })
-    .await?
+    Ok(hasher.finalize())
 }
 
 /// Format mismatch errors into a human-readable message
@@ -227,71 +173,56 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Helper to create a FileHash from content
+    fn make_hash(relative_path: &str, content: &[u8]) -> FileHash {
+        let hash = blake3::hash(content);
+        FileHash {
+            relative_path: PathBuf::from(relative_path),
+            hash: *hash.as_bytes(),
+            size: content.len() as u64,
+        }
+    }
+
     #[tokio::test]
-    async fn test_verify_success() {
+    async fn test_verify_from_hashes_success() {
         let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
         let dest = temp.path().join("dest");
 
-        std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&dest).unwrap();
-
-        // Create matching files
-        std::fs::write(source.join("file1.txt"), b"hello world").unwrap();
-        std::fs::write(dest.join("file1.txt"), b"hello world").unwrap();
-
-        std::fs::create_dir_all(source.join("subdir")).unwrap();
         std::fs::create_dir_all(dest.join("subdir")).unwrap();
-        std::fs::write(source.join("subdir/nested.txt"), b"nested content").unwrap();
+
+        // Create destination files
+        std::fs::write(dest.join("file1.txt"), b"hello world").unwrap();
         std::fs::write(dest.join("subdir/nested.txt"), b"nested content").unwrap();
 
-        let (tx, mut rx) = mpsc::channel(10);
-        let req = VerifyRequest {
-            job_id: "test-job".to_string(),
-            source,
-            destination: dest,
-        };
+        // Create hashes that match the destination content
+        let file_hashes = vec![
+            make_hash("file1.txt", b"hello world"),
+            make_hash("subdir/nested.txt", b"nested content"),
+        ];
 
-        let handle = tokio::spawn(async move { verify_transfer(&req, tx).await });
-
-        // Collect progress updates
-        let mut updates = Vec::new();
-        while let Some(status) = rx.recv().await {
-            updates.push(status);
-        }
-
-        let result = handle.await.unwrap();
+        let result = verify_from_hashes("test-job", &dest, &file_hashes).await;
         assert!(result.is_ok());
 
         let verify_result = result.unwrap();
         assert_eq!(verify_result.files_verified, 2);
         assert!(verify_result.bytes_verified > 0);
-
-        // Should have progress updates
-        assert!(!updates.is_empty());
     }
 
     #[tokio::test]
-    async fn test_verify_hash_mismatch() {
+    async fn test_verify_from_hashes_mismatch() {
         let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
         let dest = temp.path().join("dest");
 
-        std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&dest).unwrap();
 
-        // Create files with different content
-        std::fs::write(source.join("file.txt"), b"original content").unwrap();
+        // Create destination file with different content than expected
         std::fs::write(dest.join("file.txt"), b"corrupted content").unwrap();
 
-        let (tx, _rx) = mpsc::channel(10);
-        let req = VerifyRequest {
-            job_id: "test-job".to_string(),
-            source,
-            destination: dest,
-        };
+        // Hash is for "original content" but file contains "corrupted content"
+        let file_hashes = vec![make_hash("file.txt", b"original content")];
 
-        let result = verify_transfer(&req, tx).await;
+        let result = verify_from_hashes("test-job", &dest, &file_hashes).await;
         assert!(result.is_err());
 
         let err = result.unwrap_err().to_string();
@@ -300,25 +231,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_missing_file() {
+    async fn test_verify_from_hashes_missing_file() {
         let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
         let dest = temp.path().join("dest");
 
-        std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&dest).unwrap();
 
-        // Create file in source only
-        std::fs::write(source.join("missing.txt"), b"this file is missing").unwrap();
+        // Hash for a file that doesn't exist in destination
+        let file_hashes = vec![make_hash("missing.txt", b"this file is missing")];
 
-        let (tx, _rx) = mpsc::channel(10);
-        let req = VerifyRequest {
-            job_id: "test-job".to_string(),
-            source,
-            destination: dest,
-        };
-
-        let result = verify_transfer(&req, tx).await;
+        let result = verify_from_hashes("test-job", &dest, &file_hashes).await;
         assert!(result.is_err());
 
         let err = result.unwrap_err().to_string();
@@ -327,32 +249,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_collects_all_mismatches() {
+    async fn test_verify_from_hashes_collects_all_mismatches() {
         let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
         let dest = temp.path().join("dest");
 
-        std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&dest).unwrap();
 
-        // Create multiple mismatches
-        std::fs::write(source.join("a.txt"), b"content a").unwrap();
+        // Create some files with wrong content
         std::fs::write(dest.join("a.txt"), b"wrong a").unwrap();
-
-        std::fs::write(source.join("b.txt"), b"content b").unwrap();
-        // b.txt missing in dest
-
-        std::fs::write(source.join("c.txt"), b"content c").unwrap();
+        // b.txt is missing
         std::fs::write(dest.join("c.txt"), b"wrong c").unwrap();
 
-        let (tx, _rx) = mpsc::channel(10);
-        let req = VerifyRequest {
-            job_id: "test-job".to_string(),
-            source,
-            destination: dest,
-        };
+        let file_hashes = vec![
+            make_hash("a.txt", b"content a"),
+            make_hash("b.txt", b"content b"),
+            make_hash("c.txt", b"content c"),
+        ];
 
-        let result = verify_transfer(&req, tx).await;
+        let result = verify_from_hashes("test-job", &dest, &file_hashes).await;
         assert!(result.is_err());
 
         let err = result.unwrap_err().to_string();
@@ -361,22 +275,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_empty_directory() {
+    async fn test_verify_from_hashes_empty() {
         let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
         let dest = temp.path().join("dest");
 
-        std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&dest).unwrap();
 
-        let (tx, _rx) = mpsc::channel(10);
-        let req = VerifyRequest {
-            job_id: "test-job".to_string(),
-            source,
-            destination: dest,
-        };
+        let file_hashes: Vec<FileHash> = vec![];
 
-        let result = verify_transfer(&req, tx).await;
+        let result = verify_from_hashes("test-job", &dest, &file_hashes).await;
         assert!(result.is_ok());
 
         let verify_result = result.unwrap();

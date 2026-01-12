@@ -17,7 +17,7 @@
 //! - Subscriptions: Add `subscribe.*` methods for real-time event streaming
 
 pub mod client;
-mod methods;
+pub mod methods;
 mod protocol;
 mod transport;
 
@@ -25,10 +25,10 @@ use std::net::SocketAddr;
 use tokio::sync::broadcast;
 
 use crate::context::AppContext;
-use methods::MethodHandler;
 use transport::Transport;
 
 pub use client::RpcClient;
+pub use methods::MethodHandler;
 pub use protocol::{Request, Response, RpcError};
 
 /// RPC server that exposes daemon functionality to clients.

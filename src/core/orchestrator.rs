@@ -11,7 +11,7 @@ use crate::core::hardware::{BlockDevice, HardwareAdapter, HardwareEvent};
 use crate::core::notifications::JobEvent;
 use crate::core::ownership::get_backup_owner;
 use crate::core::transfer_engine::{self, TransferRequest, TransferStatus};
-use crate::core::verifier::{VerifyRequest, verify_transfer};
+use crate::core::verifier::verify_from_hashes;
 use crate::logging::LogThrottle;
 use crate::{adapters, db};
 use anyhow::Result;
@@ -171,29 +171,34 @@ impl Orchestrator {
                 Ok(result) => {
                     let _ = progress_tx.send(TransferStatus::CopyComplete).await;
 
-                    if config.verify_transfers && !config.simulation {
-                        let verify_req = VerifyRequest {
-                            job_id: job_id.clone(),
-                            source: transfer_req.source.clone(),
-                            destination: transfer_req.destination.clone(),
-                        };
-
-                        match verify_transfer(&verify_req, progress_tx.clone()).await {
-                            Ok(_verify_result) => {
-                                let _ = progress_tx
-                                    .send(TransferStatus::Complete {
-                                        total_bytes: result.total_bytes,
-                                        duration_secs: result.duration_secs,
-                                    })
-                                    .await;
+                    // Verify if enabled and we have file hashes from the transfer
+                    let verification_passed = if config.verify_transfers && !config.simulation {
+                        match &result.file_hashes {
+                            Some(hashes) => {
+                                // Fast path: verify using hashes computed during copy
+                                match verify_from_hashes(&job_id, &transfer_req.destination, hashes)
+                                    .await
+                                {
+                                    Ok(_) => true,
+                                    Err(e) => {
+                                        let _ = progress_tx
+                                            .send(TransferStatus::Failed(e.to_string()))
+                                            .await;
+                                        false
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                let _ = progress_tx
-                                    .send(TransferStatus::Failed(e.to_string()))
-                                    .await;
+                            None => {
+                                // Engine handles verification internally (e.g., rsync --checksum)
+                                // or doesn't support it (simulated) - trust the transfer
+                                true
                             }
                         }
                     } else {
+                        true
+                    };
+
+                    if verification_passed {
                         let _ = progress_tx
                             .send(TransferStatus::Complete {
                                 total_bytes: result.total_bytes,
@@ -235,17 +240,6 @@ impl Orchestrator {
                                 job_id_for_consumer.clone(),
                                 "copy_complete".to_string(),
                                 None,
-                                None,
-                                None,
-                            )
-                            .await;
-                        }
-                        TransferStatus::Verifying { current, total } => {
-                            let _ = db::jobs::update_status(
-                                &db,
-                                job_id_for_consumer.clone(),
-                                "verifying".to_string(),
-                                Some(format!("{}/{} files", current, total)),
                                 None,
                                 None,
                             )

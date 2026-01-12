@@ -12,4 +12,4 @@ pub use models::{Job, JobStatusEntry, JobWithHistory, TargetDrive};
 pub use orchestrator::Orchestrator;
 pub use ownership::{FileOwner, get_backup_owner};
 pub use progress::ProgressTracker;
-pub use verifier::{VerifyRequest, VerifyResult, verify_transfer};
+pub use verifier::{VerifyResult, verify_from_hashes};

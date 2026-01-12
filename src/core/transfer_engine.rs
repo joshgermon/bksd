@@ -11,6 +11,14 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use tokio::sync::mpsc;
 
+/// Hash of a file computed during transfer (for verification)
+#[derive(Debug, Clone)]
+pub struct FileHash {
+    pub relative_path: PathBuf,
+    pub hash: [u8; 32], // BLAKE3 hash (32 bytes)
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 pub enum TransferEngineType {
     /// Native Rust file copy - safe, fast, with progress tracking
@@ -37,6 +45,10 @@ pub struct TransferResult {
     pub total_bytes: u64,
     /// Duration of the transfer in seconds
     pub duration_secs: u64,
+    /// File hashes computed during transfer (for verification).
+    /// None if the engine handles verification internally (e.g., rsync --checksum)
+    /// or doesn't support inline hashing (e.g., simulated).
+    pub file_hashes: Option<Vec<FileHash>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,10 +66,6 @@ pub enum TransferStatus {
         eta_seconds: Option<u64>,
     },
     CopyComplete,
-    Verifying {
-        current: u64,
-        total: u64,
-    },
     Complete {
         /// Total bytes transferred during the backup
         total_bytes: u64,

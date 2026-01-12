@@ -1,11 +1,11 @@
 //! UI rendering for the TUI.
 
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
-    Frame,
 };
 
 use crate::core::transfer_engine::TransferStatus;
@@ -148,7 +148,10 @@ fn render_recent_jobs(frame: &mut Frame, app: &TuiApp, area: Rect, selected: usi
             let line = Line::from(vec![
                 Span::raw(if is_selected { "> " } else { "  " }),
                 status_icon,
-                Span::raw(format!("  {}  {}  {}", job_id_short, created_short, &job.status)),
+                Span::raw(format!(
+                    "  {}  {}  {}",
+                    job_id_short, created_short, &job.status
+                )),
             ]);
 
             ListItem::new(line).style(style)
@@ -296,7 +299,9 @@ fn render_detail(frame: &mut Frame, app: &TuiApp, area: Rect, _job_id: &str, _sc
 
 fn render_footer(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let help_text = match &app.view {
-        View::Dashboard { .. } => "[↑↓] Navigate  [Enter] Details  [h] History  [r] Refresh  [q] Quit",
+        View::Dashboard { .. } => {
+            "[↑↓] Navigate  [Enter] Details  [h] History  [r] Refresh  [q] Quit"
+        }
         View::History { .. } => "[↑↓] Navigate  [Enter] Details  [Esc] Back  [q] Quit",
         View::Detail { .. } => "[Esc] Back  [q] Quit",
     };
@@ -344,21 +349,6 @@ fn format_active_banner(job_id: &str, status: &TransferStatus) -> Line<'static> 
             Span::styled("▶ ", Style::default().fg(Color::Yellow)),
             Span::raw(format!("{}  Copy complete, verifying...", job_id)),
         ]),
-        TransferStatus::Verifying { current, total } => {
-            let pct = if *total > 0 {
-                (current * 100 / total) as u8
-            } else {
-                100
-            };
-            let bar = progress_bar(pct, 25);
-            Line::from(vec![
-                Span::styled("▶ ", Style::default().fg(Color::Yellow)),
-                Span::raw(format!(
-                    "{}  {} {:>3}%  Verifying {}/{}",
-                    job_id, bar, pct, current, total
-                )),
-            ])
-        }
         TransferStatus::Complete {
             total_bytes,
             duration_secs,

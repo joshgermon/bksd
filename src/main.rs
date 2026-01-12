@@ -3,6 +3,7 @@ use bksd::core::transfer_engine::TransferEngineType;
 use bksd::logging::{self, LogConfig};
 use bksd::rpc::{RpcClient, RpcServer};
 use bksd::service::{ServiceManager, configs_differ, prompt_restart};
+use bksd::web::WebServer;
 use bksd::{config, context, core::Orchestrator, db};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -169,9 +170,27 @@ async fn run_daemon(ctx: context::AppContext) -> Result<()> {
         None
     };
 
+    let web_server = if ctx.config.web_enabled {
+        let server = Arc::new(WebServer::new(ctx.clone(), ctx.config.web_bind));
+        let server_clone = server.clone();
+        let server_handle = tokio::spawn(async move {
+            if let Err(e) = server_clone.start().await {
+                tracing::error!(error = %e, "Web server error");
+            }
+        });
+        Some((server, server_handle))
+    } else {
+        None
+    };
+
     let result = Orchestrator::new(ctx).start().await;
 
     if let Some((server, handle)) = rpc_server {
+        server.shutdown();
+        handle.abort();
+    }
+
+    if let Some((server, handle)) = web_server {
         server.shutdown();
         handle.abort();
     }

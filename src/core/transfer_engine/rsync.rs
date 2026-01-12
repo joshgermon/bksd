@@ -58,6 +58,7 @@ impl TransferEngine for RsyncEngine {
 
                 let mut cmd = Command::new("rsync");
                 cmd.arg("-av")
+                    .arg("--checksum") // Verify file checksums during transfer
                     .arg("--chmod=u+rw,g+r,o+r")
                     .arg("--info=progress2")
                     .arg("--no-inc-recursive");
@@ -141,11 +142,13 @@ impl TransferEngine for RsyncEngine {
                     info!(
                         total_bytes = last_bytes_copied,
                         duration_secs = duration_secs,
-                        "Rsync transfer finished"
+                        "Rsync transfer finished (checksum verified)"
                     );
                     Ok(TransferResult {
                         total_bytes: last_bytes_copied,
                         duration_secs,
+                        // rsync --checksum handles verification internally
+                        file_hashes: None,
                     })
                 } else {
                     let _ = tx

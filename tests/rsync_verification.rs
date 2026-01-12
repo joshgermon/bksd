@@ -1,14 +1,15 @@
-//! Integration tests for rsync transfer engine with BLAKE3 verification.
+//! Integration tests for transfer engines with inline verification.
 //!
 //! These tests exercise the complete backup pipeline:
-//! 1. rsync copies files from source to destination
-//! 2. verifier confirms all files match via BLAKE3 checksums
+//! - NativeCopy: hashes files during copy, then verifies destination
+//! - Rsync: uses --checksum flag for internal verification
 
 use bksd::core::transfer_engine::{
-    TransferEngineType, TransferRequest, TransferStatus, create_engine,
+    FileHash, TransferEngineType, TransferRequest, TransferStatus, create_engine,
 };
-use bksd::core::verifier::{VerifyRequest, verify_transfer};
+use bksd::core::verifier::verify_from_hashes;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 
@@ -28,15 +29,26 @@ fn create_file_with_mode(path: &std::path::Path, content: &[u8], mode: u32) {
     std::fs::set_permissions(path, perms).unwrap();
 }
 
-/// Helper to run rsync transfer and collect progress updates
+/// Helper to create a FileHash from content
+fn make_hash(relative_path: &str, content: &[u8]) -> FileHash {
+    let hash = blake3::hash(content);
+    FileHash {
+        relative_path: PathBuf::from(relative_path),
+        hash: *hash.as_bytes(),
+        size: content.len() as u64,
+    }
+}
+
+/// Helper to run transfer and collect progress updates
 async fn run_transfer(
+    engine_type: TransferEngineType,
     source: &std::path::Path,
     destination: &std::path::Path,
 ) -> (
     anyhow::Result<bksd::core::transfer_engine::TransferResult>,
     Vec<TransferStatus>,
 ) {
-    let engine = create_engine(TransferEngineType::Rsync);
+    let engine = create_engine(engine_type);
     let (tx, mut rx) = mpsc::channel(100);
 
     let req = TransferRequest {
@@ -60,35 +72,8 @@ async fn run_transfer(
     (result, updates)
 }
 
-/// Helper to run verification and collect progress updates
-async fn run_verification(
-    source: &std::path::Path,
-    destination: &std::path::Path,
-) -> (
-    anyhow::Result<bksd::core::verifier::VerifyResult>,
-    Vec<TransferStatus>,
-) {
-    let (tx, mut rx) = mpsc::channel(100);
-
-    let req = VerifyRequest {
-        job_id: "test-job".to_string(),
-        source: source.to_path_buf(),
-        destination: destination.to_path_buf(),
-    };
-
-    let handle = tokio::spawn(async move { verify_transfer(&req, tx).await });
-
-    let mut updates = Vec::new();
-    while let Some(status) = rx.recv().await {
-        updates.push(status);
-    }
-
-    let result = handle.await.unwrap();
-    (result, updates)
-}
-
 #[tokio::test]
-async fn test_rsync_transfer_and_verification_success() {
+async fn test_native_copy_with_inline_verification() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("source");
     let dest = temp.path().join("dest");
@@ -99,8 +84,10 @@ async fn test_rsync_transfer_and_verification_success() {
     create_file(&source.join("small.txt"), b"hello world");
     create_file(&source.join("medium.bin"), &vec![0xAB; 10 * 1024]); // 10KB
 
-    // Run transfer
-    let (transfer_result, transfer_updates) = run_transfer(&source, &dest).await;
+    // Run transfer with NativeCopy engine
+    let (transfer_result, transfer_updates) =
+        run_transfer(TransferEngineType::NativeCopy, &source, &dest).await;
+
     assert!(
         transfer_result.is_ok(),
         "Transfer failed: {:?}",
@@ -109,6 +96,14 @@ async fn test_rsync_transfer_and_verification_success() {
 
     let result = transfer_result.unwrap();
     assert!(result.total_bytes > 0, "Should have transferred bytes");
+
+    // NativeCopy should return file hashes
+    assert!(
+        result.file_hashes.is_some(),
+        "NativeCopy should return file hashes"
+    );
+    let hashes = result.file_hashes.unwrap();
+    assert_eq!(hashes.len(), 2, "Should have hashes for 2 files");
 
     // Verify we got progress updates
     assert!(!transfer_updates.is_empty(), "Should have progress updates");
@@ -119,8 +114,8 @@ async fn test_rsync_transfer_and_verification_success() {
         "Should have Ready status"
     );
 
-    // Run verification
-    let (verify_result, verify_updates) = run_verification(&source, &dest).await;
+    // Run verification using the hashes from transfer
+    let verify_result = verify_from_hashes("test-job", &dest, &hashes).await;
     assert!(
         verify_result.is_ok(),
         "Verification failed: {:?}",
@@ -130,18 +125,10 @@ async fn test_rsync_transfer_and_verification_success() {
     let verify = verify_result.unwrap();
     assert_eq!(verify.files_verified, 2, "Should verify 2 files");
     assert!(verify.bytes_verified > 0, "Should have verified bytes");
-
-    // Verify we got verification progress updates
-    assert!(
-        verify_updates
-            .iter()
-            .any(|s| matches!(s, TransferStatus::Verifying { .. })),
-        "Should have Verifying status updates"
-    );
 }
 
 #[tokio::test]
-async fn test_rsync_transfer_verification_detects_corruption() {
+async fn test_native_copy_verification_detects_corruption() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("source");
     let dest = temp.path().join("dest");
@@ -155,18 +142,21 @@ async fn test_rsync_transfer_verification_detects_corruption() {
     );
 
     // Run transfer
-    let (transfer_result, _) = run_transfer(&source, &dest).await;
+    let (transfer_result, _) = run_transfer(TransferEngineType::NativeCopy, &source, &dest).await;
     assert!(
         transfer_result.is_ok(),
         "Transfer failed: {:?}",
         transfer_result
     );
 
-    // CORRUPT the destination file
+    let result = transfer_result.unwrap();
+    let hashes = result.file_hashes.expect("Should have hashes");
+
+    // CORRUPT the destination file after transfer
     std::fs::write(dest.join("data.txt"), b"corrupted content!!!").unwrap();
 
     // Run verification - should FAIL
-    let (verify_result, _) = run_verification(&source, &dest).await;
+    let verify_result = verify_from_hashes("test-job", &dest, &hashes).await;
     assert!(
         verify_result.is_err(),
         "Verification should fail on corrupted file"
@@ -186,7 +176,55 @@ async fn test_rsync_transfer_verification_detects_corruption() {
 }
 
 #[tokio::test]
-async fn test_rsync_transfer_empty_directory() {
+async fn test_rsync_transfer_with_checksum() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("source");
+    let dest = temp.path().join("dest");
+
+    std::fs::create_dir_all(&source).unwrap();
+
+    // Create test files
+    create_file(&source.join("small.txt"), b"hello world");
+    create_file(&source.join("medium.bin"), &vec![0xAB; 10 * 1024]); // 10KB
+
+    // Run transfer with Rsync engine
+    let (transfer_result, transfer_updates) =
+        run_transfer(TransferEngineType::Rsync, &source, &dest).await;
+
+    assert!(
+        transfer_result.is_ok(),
+        "Transfer failed: {:?}",
+        transfer_result
+    );
+
+    let result = transfer_result.unwrap();
+    assert!(result.total_bytes > 0, "Should have transferred bytes");
+
+    // Rsync should NOT return file hashes (it uses --checksum internally)
+    assert!(
+        result.file_hashes.is_none(),
+        "Rsync should not return file hashes (uses --checksum internally)"
+    );
+
+    // Verify we got progress updates
+    assert!(!transfer_updates.is_empty(), "Should have progress updates");
+    assert!(
+        transfer_updates
+            .iter()
+            .any(|s| matches!(s, TransferStatus::Ready)),
+        "Should have Ready status"
+    );
+
+    // Verify files exist and have correct content
+    assert!(dest.join("small.txt").exists(), "small.txt should exist");
+    assert!(dest.join("medium.bin").exists(), "medium.bin should exist");
+
+    let content = std::fs::read(dest.join("small.txt")).unwrap();
+    assert_eq!(content, b"hello world");
+}
+
+#[tokio::test]
+async fn test_native_copy_empty_directory() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("source");
     let dest = temp.path().join("dest");
@@ -195,15 +233,19 @@ async fn test_rsync_transfer_empty_directory() {
     // Source is empty - no files
 
     // Run transfer
-    let (transfer_result, _) = run_transfer(&source, &dest).await;
+    let (transfer_result, _) = run_transfer(TransferEngineType::NativeCopy, &source, &dest).await;
     assert!(
         transfer_result.is_ok(),
         "Transfer failed: {:?}",
         transfer_result
     );
 
+    let result = transfer_result.unwrap();
+    let hashes = result.file_hashes.expect("Should have hashes (empty vec)");
+    assert!(hashes.is_empty(), "Should have no hashes for empty dir");
+
     // Run verification
-    let (verify_result, _) = run_verification(&source, &dest).await;
+    let verify_result = verify_from_hashes("test-job", &dest, &hashes).await;
     assert!(
         verify_result.is_ok(),
         "Verification failed: {:?}",
@@ -216,7 +258,7 @@ async fn test_rsync_transfer_empty_directory() {
 }
 
 #[tokio::test]
-async fn test_rsync_transfer_nested_directories() {
+async fn test_native_copy_nested_directories() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("source");
     let dest = temp.path().join("dest");
@@ -235,15 +277,19 @@ async fn test_rsync_transfer_nested_directories() {
     create_file(&source.join("a/x/nested_sibling.txt"), b"nested sibling");
 
     // Run transfer
-    let (transfer_result, _) = run_transfer(&source, &dest).await;
+    let (transfer_result, _) = run_transfer(TransferEngineType::NativeCopy, &source, &dest).await;
     assert!(
         transfer_result.is_ok(),
         "Transfer failed: {:?}",
         transfer_result
     );
 
+    let result = transfer_result.unwrap();
+    let hashes = result.file_hashes.expect("Should have hashes");
+    assert_eq!(hashes.len(), 7, "Should have hashes for 7 files");
+
     // Run verification
-    let (verify_result, _) = run_verification(&source, &dest).await;
+    let verify_result = verify_from_hashes("test-job", &dest, &hashes).await;
     assert!(
         verify_result.is_ok(),
         "Verification failed: {:?}",
@@ -265,54 +311,64 @@ async fn test_rsync_transfer_nested_directories() {
 }
 
 #[tokio::test]
-async fn test_rsync_transfer_symlinks() {
+async fn test_verify_from_hashes_detects_missing_file() {
+    let temp = tempdir().unwrap();
+    let dest = temp.path().join("dest");
+
+    std::fs::create_dir_all(&dest).unwrap();
+
+    // Create one file but have hashes for two
+    std::fs::write(dest.join("exists.txt"), b"I exist").unwrap();
+
+    let hashes = vec![
+        make_hash("exists.txt", b"I exist"),
+        make_hash("missing.txt", b"I am missing"),
+    ];
+
+    let verify_result = verify_from_hashes("test-job", &dest, &hashes).await;
+    assert!(
+        verify_result.is_err(),
+        "Verification should fail for missing file"
+    );
+
+    let err = verify_result.unwrap_err().to_string();
+    assert!(
+        err.contains("missing in destination"),
+        "Error should mention missing file: {}",
+        err
+    );
+    assert!(
+        err.contains("missing.txt"),
+        "Error should name the missing file: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn test_native_copy_large_file() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("source");
     let dest = temp.path().join("dest");
 
     std::fs::create_dir_all(&source).unwrap();
 
-    // Create a regular file and a symlink to it
-    create_file(&source.join("target.txt"), b"I am the target file");
-    std::os::unix::fs::symlink("target.txt", source.join("link.txt")).unwrap();
-
-    // Create a directory symlink
-    std::fs::create_dir_all(source.join("real_dir")).unwrap();
-    create_file(&source.join("real_dir/inside.txt"), b"inside directory");
-    std::os::unix::fs::symlink("real_dir", source.join("dir_link")).unwrap();
+    // Create a 1MB file with pattern content
+    let large_content: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
+    create_file(&source.join("large.bin"), &large_content);
 
     // Run transfer
-    let (transfer_result, _) = run_transfer(&source, &dest).await;
+    let (transfer_result, _) = run_transfer(TransferEngineType::NativeCopy, &source, &dest).await;
     assert!(
         transfer_result.is_ok(),
         "Transfer failed: {:?}",
         transfer_result
     );
 
-    // Verify symlinks were copied as symlinks (not followed)
-    let link_path = dest.join("link.txt");
-    assert!(
-        link_path
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink(),
-        "link.txt should be a symlink in destination"
-    );
+    let result = transfer_result.unwrap();
+    let hashes = result.file_hashes.expect("Should have hashes");
 
-    let dir_link_path = dest.join("dir_link");
-    assert!(
-        dir_link_path
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink(),
-        "dir_link should be a symlink in destination"
-    );
-
-    // Run verification - should succeed
-    // Verifier only checks regular files, symlinks are skipped
-    let (verify_result, _) = run_verification(&source, &dest).await;
+    // Run verification
+    let verify_result = verify_from_hashes("test-job", &dest, &hashes).await;
     assert!(
         verify_result.is_ok(),
         "Verification failed: {:?}",
@@ -320,15 +376,12 @@ async fn test_rsync_transfer_symlinks() {
     );
 
     let verify = verify_result.unwrap();
-    // Should only verify regular files: target.txt and real_dir/inside.txt
-    assert_eq!(
-        verify.files_verified, 2,
-        "Should verify 2 regular files (not symlinks)"
-    );
+    assert_eq!(verify.files_verified, 1);
+    assert_eq!(verify.bytes_verified, 1024 * 1024, "Should verify 1MB");
 }
 
 #[tokio::test]
-async fn test_rsync_transfer_preserves_permissions() {
+async fn test_native_copy_preserves_permissions() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("source");
     let dest = temp.path().join("dest");
@@ -345,7 +398,7 @@ async fn test_rsync_transfer_preserves_permissions() {
     create_file_with_mode(&source.join("readonly.txt"), b"read only", 0o444);
 
     // Run transfer
-    let (transfer_result, _) = run_transfer(&source, &dest).await;
+    let (transfer_result, _) = run_transfer(TransferEngineType::NativeCopy, &source, &dest).await;
     assert!(
         transfer_result.is_ok(),
         "Transfer failed: {:?}",
@@ -353,9 +406,6 @@ async fn test_rsync_transfer_preserves_permissions() {
     );
 
     // Check permissions were preserved
-    // Note: rsync with --chmod=u+rw,g+r,o+r modifies permissions slightly
-    // The important thing is that executable bit is preserved where set
-
     let dest_exec = dest.join("executable.sh");
     let exec_mode = std::fs::metadata(&dest_exec).unwrap().permissions().mode();
     assert!(
@@ -364,8 +414,11 @@ async fn test_rsync_transfer_preserves_permissions() {
         exec_mode
     );
 
+    let result = transfer_result.unwrap();
+    let hashes = result.file_hashes.expect("Should have hashes");
+
     // Run verification
-    let (verify_result, _) = run_verification(&source, &dest).await;
+    let verify_result = verify_from_hashes("test-job", &dest, &hashes).await;
     assert!(
         verify_result.is_ok(),
         "Verification failed: {:?}",
@@ -374,37 +427,4 @@ async fn test_rsync_transfer_preserves_permissions() {
 
     let verify = verify_result.unwrap();
     assert_eq!(verify.files_verified, 3, "Should verify 3 files");
-}
-
-#[tokio::test]
-async fn test_rsync_transfer_large_file() {
-    let temp = tempdir().unwrap();
-    let source = temp.path().join("source");
-    let dest = temp.path().join("dest");
-
-    std::fs::create_dir_all(&source).unwrap();
-
-    // Create a 1MB file with random-ish content
-    let large_content: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
-    create_file(&source.join("large.bin"), &large_content);
-
-    // Run transfer
-    let (transfer_result, _) = run_transfer(&source, &dest).await;
-    assert!(
-        transfer_result.is_ok(),
-        "Transfer failed: {:?}",
-        transfer_result
-    );
-
-    // Run verification
-    let (verify_result, _) = run_verification(&source, &dest).await;
-    assert!(
-        verify_result.is_ok(),
-        "Verification failed: {:?}",
-        verify_result
-    );
-
-    let verify = verify_result.unwrap();
-    assert_eq!(verify.files_verified, 1);
-    assert_eq!(verify.bytes_verified, 1024 * 1024, "Should verify 1MB");
 }

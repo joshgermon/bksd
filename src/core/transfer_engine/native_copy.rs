@@ -1,12 +1,11 @@
 use crate::core::transfer_engine::{
-    TransferEngine, TransferRequest, TransferResult, TransferStatus,
+    FileHash, TransferEngine, TransferRequest, TransferResult, TransferStatus,
 };
 use anyhow::{Result, anyhow, bail};
 use nix::unistd::{Gid, Group, Uid, User, chown};
-use std::fs::{self, File, Permissions};
+use std::fs::{self, File};
 use std::future::Future;
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Instant;
@@ -144,7 +143,7 @@ impl TransferEngine for NativeCopyEngine {
                 .await;
 
                 match result {
-                    Ok(bytes_copied) => {
+                    Ok((bytes_copied, file_hashes)) => {
                         let duration_secs = start_time.elapsed().as_secs();
                         let speed_mbps = if duration_secs > 0 {
                             bytes_copied as f64 / (1024.0 * 1024.0) / duration_secs as f64
@@ -156,12 +155,14 @@ impl TransferEngine for NativeCopyEngine {
                             total_bytes = bytes_copied,
                             duration_secs = duration_secs,
                             speed_mbps = format!("{:.2}", speed_mbps),
+                            files_hashed = file_hashes.len(),
                             "Native copy transfer complete"
                         );
 
                         Ok(TransferResult {
                             total_bytes: bytes_copied,
                             duration_secs,
+                            file_hashes: Some(file_hashes),
                         })
                     }
                     Err(e) => {
@@ -352,7 +353,8 @@ async fn create_directory_structure(
     .await?
 }
 
-/// Copy all files with progress reporting
+/// Copy all files with progress reporting.
+/// Returns (bytes_copied, file_hashes) on success.
 async fn copy_files_with_progress(
     source: &Path,
     destination: &Path,
@@ -361,7 +363,7 @@ async fn copy_files_with_progress(
     options: &CopyOptions,
     start_time: Instant,
     tx: mpsc::Sender<TransferStatus>,
-) -> Result<u64> {
+) -> Result<(u64, Vec<FileHash>)> {
     let source = source.to_path_buf();
     let destination = destination.to_path_buf();
     let files = files.to_vec();
@@ -372,6 +374,7 @@ async fn copy_files_with_progress(
         let mut bytes_copied: u64 = 0;
         let mut last_progress_update: u64 = 0;
         let mut errors: Vec<CopyError> = Vec::new();
+        let mut file_hashes: Vec<FileHash> = Vec::with_capacity(files.len());
 
         for file_info in &files {
             let relative = file_info
@@ -384,8 +387,15 @@ async fn copy_files_with_progress(
             debug!(file = %current_file, size = file_info.size, "Copying file");
 
             match copy_single_file(&file_info.path, &dest_path, sync_files, owner_ids.as_ref()) {
-                Ok(file_bytes) => {
+                Ok((file_bytes, hash)) => {
                     bytes_copied += file_bytes;
+
+                    // Store the hash for verification
+                    file_hashes.push(FileHash {
+                        relative_path: relative.to_path_buf(),
+                        hash: *hash.as_bytes(),
+                        size: file_bytes,
+                    });
 
                     // Send progress update if enough bytes have been copied
                     if bytes_copied - last_progress_update >= PROGRESS_UPDATE_INTERVAL
@@ -398,11 +408,7 @@ async fn copy_files_with_progress(
                         };
 
                         // Calculate ETA based on current transfer speed
-                        let eta_seconds = calculate_eta(
-                            start_time,
-                            bytes_copied,
-                            total_bytes,
-                        );
+                        let eta_seconds = calculate_eta(start_time, bytes_copied, total_bytes);
 
                         let _ = tx.blocking_send(TransferStatus::InProgress {
                             total_bytes,
@@ -461,12 +467,13 @@ async fn copy_files_with_progress(
             return Err(anyhow!(error_summary));
         }
 
-        Ok(bytes_copied)
+        Ok((bytes_copied, file_hashes))
     })
     .await?
 }
 
 /// Error information from a file copy operation
+#[derive(Debug)]
 struct FileCopyError {
     message: String,
     is_device_removed: bool,
@@ -478,13 +485,14 @@ struct CopyError {
     message: String,
 }
 
-/// Copy a single file with metadata preservation
+/// Copy a single file with metadata preservation.
+/// Returns (bytes_written, blake3_hash) on success.
 fn copy_single_file(
     source: &Path,
     dest: &Path,
     sync_file: bool,
     owner_ids: Option<&OwnerIds>,
-) -> Result<u64, FileCopyError> {
+) -> Result<(u64, blake3::Hash), FileCopyError> {
     // Read source file metadata first
     let source_metadata = fs::metadata(source).map_err(|e| FileCopyError {
         message: format!("Failed to read source metadata: {}", e),
@@ -505,9 +513,10 @@ fn copy_single_file(
     })?;
     let mut writer = BufWriter::with_capacity(BUFFER_SIZE, dest_file);
 
-    // Copy data in chunks
+    // Copy data in chunks while hashing
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut bytes_written: u64 = 0;
+    let mut hasher = blake3::Hasher::new();
 
     loop {
         let bytes_read = reader.read(&mut buffer).map_err(|e| FileCopyError {
@@ -518,6 +527,9 @@ fn copy_single_file(
         if bytes_read == 0 {
             break;
         }
+
+        // Hash the data as we read it
+        hasher.update(&buffer[..bytes_read]);
 
         writer
             .write_all(&buffer[..bytes_read])
@@ -578,7 +590,7 @@ fn copy_single_file(
         }
     }
 
-    Ok(bytes_written)
+    Ok((bytes_written, hasher.finalize()))
 }
 
 /// Preserve access and modification timestamps from source to destination
@@ -663,7 +675,7 @@ fn is_device_error_code(code: i32) -> bool {
         code,
         libc::EIO      // I/O error
         | libc::ENODEV // No such device
-        | libc::ENXIO  // No such device or address
+        | libc::ENXIO // No such device or address
     )
 }
 
@@ -673,13 +685,15 @@ fn is_device_error_code(code: i32) -> bool {
         code,
         libc::EIO      // I/O error
         | libc::ENODEV // No such device
-        | libc::ENXIO  // No such device or address
+        | libc::ENXIO // No such device or address
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     #[test]
@@ -758,7 +772,7 @@ mod tests {
             owner: None,
         };
 
-        let handle = tokio::spawn(async move { engine.transfer(&req, tx).await.await });
+        let handle = tokio::spawn(async move { engine.transfer(&req, tx).await });
 
         // Collect progress updates
         let mut updates = Vec::new();
@@ -806,7 +820,7 @@ mod tests {
             owner: None,
         };
 
-        let result = engine.transfer(&req, tx).await.await;
+        let result = engine.transfer(&req, tx).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
     }
@@ -822,9 +836,15 @@ mod tests {
 
         let result = copy_single_file(&source, &dest, true, None);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), content.len() as u64);
+        let (bytes, hash) = result.unwrap();
+        assert_eq!(bytes, content.len() as u64);
 
+        // Verify content was copied correctly
         let copied_content = fs::read(&dest).unwrap();
         assert_eq!(copied_content, content);
+
+        // Verify hash matches what we'd compute directly
+        let expected_hash = blake3::hash(content);
+        assert_eq!(hash, expected_hash);
     }
 }

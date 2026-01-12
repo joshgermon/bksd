@@ -41,6 +41,10 @@ pub struct AppConfig {
     pub rpc_enabled: bool,
     /// Address and port for the RPC server to bind to
     pub rpc_bind: SocketAddr,
+    /// Enable the web dashboard server
+    pub web_enabled: bool,
+    /// Address and port for the web dashboard to bind to
+    pub web_bind: SocketAddr,
     /// Verify file integrity after transfer using BLAKE3 checksums
     pub verify_transfers: bool,
     /// Notification settings
@@ -59,6 +63,8 @@ impl Default for AppConfig {
             log_json: false,
             rpc_enabled: true,
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], 9847)),
+            web_enabled: true,
+            web_bind: SocketAddr::from(([127, 0, 0, 1], 9848)),
             verify_transfers: true,
             notifications: NotificationConfig::default(),
         }

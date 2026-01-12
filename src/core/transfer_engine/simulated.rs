@@ -76,6 +76,8 @@ impl TransferEngine for SimulatedEngine {
             Ok(TransferResult {
                 total_bytes: total_size,
                 duration_secs,
+                // Simulated engine doesn't produce file hashes
+                file_hashes: None,
             })
         })
     }

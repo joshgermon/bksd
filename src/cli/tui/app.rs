@@ -111,7 +111,11 @@ impl TuiApp {
         self.error = None;
 
         // Fetch daemon status
-        match self.client.call_no_params::<DaemonStatus>("daemon.status").await {
+        match self
+            .client
+            .call_no_params::<DaemonStatus>("daemon.status")
+            .await
+        {
             Ok(status) => self.data.daemon_status = Some(status),
             Err(e) => {
                 self.error = Some(format!("Failed to connect: {}", e));
@@ -120,7 +124,11 @@ impl TuiApp {
         }
 
         // Fetch active progress
-        match self.client.call_no_params::<ActiveProgress>("progress.active").await {
+        match self
+            .client
+            .call_no_params::<ActiveProgress>("progress.active")
+            .await
+        {
             Ok(progress) => self.data.active_jobs = progress.jobs,
             Err(e) => self.error = Some(format!("Failed to fetch progress: {}", e)),
         }
@@ -140,7 +148,10 @@ impl TuiApp {
 
     /// Refresh only active jobs (for polling during dashboard view).
     pub async fn refresh_active_jobs(&mut self) {
-        if let Ok(progress) = self.client.call_no_params::<ActiveProgress>("progress.active").await
+        if let Ok(progress) = self
+            .client
+            .call_no_params::<ActiveProgress>("progress.active")
+            .await
         {
             self.data.active_jobs = progress.jobs;
         }

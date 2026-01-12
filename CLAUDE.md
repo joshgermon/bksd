@@ -42,6 +42,12 @@ BKSD is a Rust backup daemon that automatically detects removable storage device
 - Methods: `daemon.status`, `jobs.list`, `jobs.get`, `progress.active`, `progress.get`
 - Used by `bksd status` CLI command
 
+**Web Dashboard** (`src/web/`)
+- HTTP server with embedded SPA (default: `127.0.0.1:9848`)
+- Terminal-like dark theme with animated status indicators
+- WebSocket endpoint (`/ws`) for real-time JSON-RPC communication
+- Reuses RPC `MethodHandler` for consistent API
+
 ### Key Types
 
 ```rust
@@ -128,6 +134,8 @@ Configuration via environment variables:
 - `BKSD_SIMULATION`: Enable simulated hardware adapter
 - `BKSD_RPC_ENABLED`: Enable RPC server (default: true)
 - `BKSD_RPC_BIND`: RPC bind address (default: 127.0.0.1:9847)
+- `BKSD_WEB_ENABLED`: Enable web dashboard (default: true)
+- `BKSD_WEB_BIND`: Web dashboard bind address (default: 127.0.0.1:9848)
 - `BKSD_VERIFY_TRANSFERS`: Verify file integrity after transfer (default: true)
 
 ## Dependencies
@@ -138,6 +146,7 @@ Key crates:
 - `nix`: Safe wrappers for mount/umount/poll syscalls
 - `tokio-rusqlite`: Async SQLite for job persistence
 - `serde_json`: JSON serialization for RPC
+- `axum`: Web framework for HTTP/WebSocket dashboard
 
 ## Future Vision
 
